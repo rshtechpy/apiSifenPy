@@ -1,0 +1,2 @@
+# Este archivo mantiene el directorio en git sin incluir los certificados
+# Coloca aquí tus certificados .pfx (no serán commiteados por .gitignore)
