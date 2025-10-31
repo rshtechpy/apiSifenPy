@@ -3,10 +3,11 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from typing import Union
+from contextlib import asynccontextmanager
 
 from config import settings
 from models import RUCResponse, DTEResponse, ErrorResponse
-from services import sifen_client, xml_parser
+from services import sifen_client, xml_parser, redis_cache
 
 # Configurar logging
 logging.basicConfig(
@@ -15,13 +16,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Gestión del ciclo de vida de la aplicación"""
+    # Startup
+    logger.info("Iniciando aplicación...")
+    await redis_cache.connect()
+    
+    yield
+    
+    # Shutdown
+    logger.info("Cerrando aplicación...")
+    await redis_cache.disconnect()
+
+
 # Crear aplicación FastAPI
 app = FastAPI(
     title="SIFEN API Wrapper",
     description="API REST para consultar servicios de facturación electrónica de Paraguay (SIFEN)",
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # Configurar CORS
@@ -52,9 +69,12 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    redis_status = await redis_cache.health_check()
+    
     return {
         "status": "ok",
-        "ambiente": settings.sifen_environment
+        "ambiente": settings.sifen_environment,
+        "redis": redis_status
     }
 
 
@@ -92,11 +112,22 @@ async def consultar_ruc(
     try:
         logger.info(f"Consultando RUC: {ruc}")
         
-        # Llamar al servicio SOAP
-        xml_response = sifen_client.consultar_ruc(ruc)
-        
-        # Parsear respuesta
-        parsed = xml_parser.parse_ruc_response(xml_response)
+        # Intentar obtener del cache primero
+        cached_data = await redis_cache.get_ruc_cache(ruc)
+        if cached_data:
+            logger.info(f"RUC {ruc} obtenido del cache")
+            parsed = cached_data
+        else:
+            logger.info(f"RUC {ruc} no encontrado en cache, consultando SIFEN")
+            # Llamar al servicio SOAP
+            xml_response = sifen_client.consultar_ruc(ruc)
+            
+            # Parsear respuesta
+            parsed = xml_parser.parse_ruc_response(xml_response)
+            
+            # Guardar en cache solo si la consulta fue exitosa
+            if parsed['codigo'] == '0502':
+                await redis_cache.set_ruc_cache(ruc, parsed)
         
         # Construir respuesta
         response = RUCResponse(
@@ -164,11 +195,22 @@ async def consultar_dte(
     try:
         logger.info(f"Consultando DTE: {cdc}")
         
-        # Llamar al servicio SOAP
-        xml_response = sifen_client.consultar_dte(cdc)
-        
-        # Parsear respuesta
-        parsed = xml_parser.parse_dte_response(xml_response)
+        # Intentar obtener del cache primero
+        cached_data = await redis_cache.get_dte_cache(cdc)
+        if cached_data:
+            logger.info(f"DTE {cdc} obtenido del cache")
+            parsed = cached_data
+        else:
+            logger.info(f"DTE {cdc} no encontrado en cache, consultando SIFEN")
+            # Llamar al servicio SOAP
+            xml_response = sifen_client.consultar_dte(cdc)
+            
+            # Parsear respuesta
+            parsed = xml_parser.parse_dte_response(xml_response)
+            
+            # Guardar en cache solo si la consulta fue exitosa
+            if parsed['codigo'] == '0422':
+                await redis_cache.set_dte_cache(cdc, parsed)
         
         # Construir respuesta
         response = DTEResponse(
@@ -199,6 +241,96 @@ async def consultar_dte(
         raise HTTPException(
             status_code=500,
             detail=f"Error consultando DTE: {str(e)}"
+        )
+
+
+@app.delete(
+    "/api/cache/ruc/{ruc}",
+    summary="Limpiar cache RUC",
+    description="Elimina la información de un RUC específico del cache"
+)
+async def clear_ruc_cache(
+    ruc: str = Path(
+        ...,
+        description="RUC del contribuyente",
+        min_length=5,
+        max_length=8,
+        regex="^[0-9]+$"
+    )
+):
+    """Elimina un RUC específico del cache"""
+    try:
+        key = redis_cache.get_ruc_key(ruc)
+        deleted = await redis_cache.delete(key)
+        
+        return {
+            "success": True,
+            "message": f"Cache del RUC {ruc} {'eliminado' if deleted else 'no encontrado'}",
+            "deleted": deleted
+        }
+    except Exception as e:
+        logger.error(f"Error limpiando cache RUC {ruc}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error limpiando cache: {str(e)}"
+        )
+
+
+@app.delete(
+    "/api/cache/dte/{cdc}",
+    summary="Limpiar cache DTE",
+    description="Elimina la información de un DTE específico del cache"
+)
+async def clear_dte_cache(
+    cdc: str = Path(
+        ...,
+        description="Código de Control del documento",
+        min_length=44,
+        max_length=44,
+        regex="^[0-9]+$"
+    )
+):
+    """Elimina un DTE específico del cache"""
+    try:
+        key = redis_cache.get_dte_key(cdc)
+        deleted = await redis_cache.delete(key)
+        
+        return {
+            "success": True,
+            "message": f"Cache del DTE {cdc} {'eliminado' if deleted else 'no encontrado'}",
+            "deleted": deleted
+        }
+    except Exception as e:
+        logger.error(f"Error limpiando cache DTE {cdc}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error limpiando cache: {str(e)}"
+        )
+
+
+@app.delete(
+    "/api/cache/all",
+    summary="Limpiar todo el cache",
+    description="Elimina toda la información del cache de SIFEN"
+)
+async def clear_all_cache():
+    """Elimina todo el cache relacionado con SIFEN"""
+    try:
+        deleted_ruc = await redis_cache.clear_pattern("sifen:ruc:*")
+        deleted_dte = await redis_cache.clear_pattern("sifen:dte:*")
+        
+        return {
+            "success": True,
+            "message": "Cache limpiado completamente",
+            "deleted_ruc": deleted_ruc,
+            "deleted_dte": deleted_dte,
+            "total_deleted": deleted_ruc + deleted_dte
+        }
+    except Exception as e:
+        logger.error(f"Error limpiando todo el cache: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error limpiando cache: {str(e)}"
         )
 
 
